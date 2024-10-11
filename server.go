@@ -30,7 +30,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -48,6 +47,7 @@ import (
 	"google.golang.org/grpc/mem"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
+	"google.golang.org/grpc/quota"
 	"google.golang.org/grpc/stats"
 	"google.golang.org/grpc/status"
 	"google.golang.org/grpc/tap"
@@ -157,6 +157,7 @@ type serverOptions struct {
 	inTapHandle           tap.ServerInHandle
 	statsHandlers         []stats.Handler
 	maxConcurrentStreams  uint32
+	streamQuotaEnforcer   quota.Enforcer
 	maxReceiveMessageSize int
 	maxSendMessageSize    int
 	unknownStreamDesc     *StreamDesc
@@ -414,12 +415,23 @@ func MaxSendMsgSize(m int) ServerOption {
 
 // MaxConcurrentStreams returns a ServerOption that will apply a limit on the number
 // of concurrent streams to each ServerTransport.
+//
+// Deprecated: use StreamConcurrencyQuotaEnforcer instead with a quota.StaticQuotaEnforcer
 func MaxConcurrentStreams(n uint32) ServerOption {
 	if n == 0 {
 		n = math.MaxUint32
 	}
 	return newFuncServerOption(func(o *serverOptions) {
 		o.maxConcurrentStreams = n
+	})
+}
+
+// StreamConcurrencyQuotaEnforcer returns a ServerOption that sets a custom quota enforcer
+// for the number of concurrent streams allowed on the server.
+// If specified this enforcer replaces the default one configured by `MaxConcurrentStreams`.
+func StreamConcurrencyQuotaEnforcer(e quota.Enforcer) ServerOption {
+	return newFuncServerOption(func(o *serverOptions) {
+		o.streamQuotaEnforcer = e
 	})
 }
 
@@ -1019,12 +1031,19 @@ func (s *Server) serveStreams(ctx context.Context, st transport.ServerTransport,
 		}
 	}()
 
-	streamQuota := newHandlerQuota(s.opts.maxConcurrentStreams)
+	streamQuota := s.opts.streamQuotaEnforcer
+	if streamQuota == nil {
+		streamQuota = quota.NewStaticQuotaEnforcer(s.opts.maxConcurrentStreams)
+	}
 	st.HandleStreams(ctx, func(stream *transport.Stream) {
 		s.handlersWG.Add(1)
-		streamQuota.acquire()
+		ticket := streamQuota.Acquire(ctx)
+		if ticket == nil {
+			// context canceled
+			return
+		}
 		f := func() {
-			defer streamQuota.release()
+			defer streamQuota.Release(ticket)
 			defer s.handlersWG.Done()
 			s.handleStream(st, stream)
 		}
@@ -2174,35 +2193,4 @@ func validateSendCompressor(name string, clientCompressors []string) error {
 		}
 	}
 	return fmt.Errorf("client does not support compressor %q", name)
-}
-
-// atomicSemaphore implements a blocking, counting semaphore. acquire should be
-// called synchronously; release may be called asynchronously.
-type atomicSemaphore struct {
-	n    atomic.Int64
-	wait chan struct{}
-}
-
-func (q *atomicSemaphore) acquire() {
-	if q.n.Add(-1) < 0 {
-		// We ran out of quota.  Block until a release happens.
-		<-q.wait
-	}
-}
-
-func (q *atomicSemaphore) release() {
-	// N.B. the "<= 0" check below should allow for this to work with multiple
-	// concurrent calls to acquire, but also note that with synchronous calls to
-	// acquire, as our system does, n will never be less than -1.  There are
-	// fairness issues (queuing) to consider if this was to be generalized.
-	if q.n.Add(1) <= 0 {
-		// An acquire was waiting on us.  Unblock it.
-		q.wait <- struct{}{}
-	}
-}
-
-func newHandlerQuota(n uint32) *atomicSemaphore {
-	a := &atomicSemaphore{wait: make(chan struct{}, 1)}
-	a.n.Store(int64(n))
-	return a
 }
